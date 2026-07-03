@@ -211,7 +211,7 @@ internal sealed class WaylandResourceImpl : IWlResourceImpl
                     normalIdx++;
                     break;
                 case WaylandArgumentCodes.Fd:
-                    close(call.NormalArgs[normalIdx++].Int32);
+                    _client.Transport.CloseFd(call.NormalArgs[normalIdx++].Int32);
                     break;
             }
         }

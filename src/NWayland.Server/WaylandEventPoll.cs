@@ -15,9 +15,16 @@ namespace NWayland.Server;
 /// <see cref="Wake"/> is the only thread-safe method. All other methods must
 /// be called from the same thread that calls <see cref="Wait"/>.
 /// </remarks>
-internal sealed class WaylandEventPoll : IDisposable
+internal sealed class WaylandEventPoll : IWaylandEventPoll
 {
     private const int MaxEvents = 64;
+
+    /// <summary>
+    /// Select the platform poll: epoll+eventfd on Linux (real socket clients +
+    /// wake), a managed semaphore wait elsewhere (fd-less transports only).
+    /// </summary>
+    internal static IWaylandEventPoll CreatePlatformDefault()
+        => OperatingSystem.IsLinux() ? new WaylandEventPoll() : new ManagedEventPoll();
 
     private readonly int _epollFd;
     private readonly int _eventFd;

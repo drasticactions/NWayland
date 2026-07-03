@@ -59,12 +59,13 @@ internal ref struct DispatchLock
 /// </remarks>
 public sealed partial class WaylandServer : IAsyncDisposable
 {
-    private readonly WaylandEventPoll _poll;
+    private readonly IWaylandEventPoll _poll;
 
     private readonly object _stateLock = new();
     private readonly Queue<WaylandClient> _pendingClients = new();
     private readonly Queue<WaylandClient> _deadClients = new();
     private readonly Queue<object?> _customEvents = new();
+    private readonly Queue<(WaylandClient Client, bool Writable)> _transportReadiness = new();
     private int _nextEventThreadId;
     private volatile bool _disposed;
     private bool _cleanedUp;
@@ -72,6 +73,7 @@ public sealed partial class WaylandServer : IAsyncDisposable
     private TaskCompletionSource? _disposeTcs;
 
     private readonly List<WaylandClient> _clients = new();
+    private readonly HashSet<WaylandClient> _registeredClients = new();
     private readonly Dictionary<int, WaylandClient> _fdToClient = new();
     private int _roundRobinIndex;
     private WaylandClient? _currentClient;
@@ -102,7 +104,10 @@ public sealed partial class WaylandServer : IAsyncDisposable
     public WaylandServer(WaylandServerOptions? options = null)
     {
         Options = options ?? new WaylandServerOptions();
-        _poll = new WaylandEventPoll();
+        // epoll+eventfd on Linux; a managed wait elsewhere, where clients are
+        // fd-less IWaylandServerTransports and readiness arrives via
+        // WaylandTransportSignal instead of an epoll registration.
+        _poll = WaylandEventPoll.CreatePlatformDefault();
     }
 
     internal List<WlServerArgument> RentArgsList()
@@ -209,6 +214,24 @@ public sealed partial class WaylandServer : IAsyncDisposable
     }
 
     /// <summary>
+    /// Add a client backed by an arbitrary <see cref="IWaylandServerTransport"/> —
+    /// e.g. a synthetic in-memory transport for a remote (waypipe) client.
+    /// Thread-safe — enqueues the client for the dispatch thread.
+    /// </summary>
+    /// <remarks>
+    /// Transport ownership is only transferred on success. If this method throws
+    /// (e.g. server is disposed), the caller retains ownership of the transport.
+    /// Transports whose <see cref="IWaylandServerTransport.PollFd"/> is null
+    /// receive a <see cref="WaylandTransportSignal"/> when the dispatch loop
+    /// registers them.
+    /// </remarks>
+    public WaylandClient AddClient(IWaylandServerTransport transport)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return EnqueueClient(transport);
+    }
+
+    /// <summary>
     /// Post a custom event that will be returned by the next <see cref="NextEvent"/> call
     /// as a <see cref="WaylandCustomEvent"/>. Thread-safe — can be called from any thread
     /// to wake up the dispatch loop.
@@ -281,7 +304,7 @@ public sealed partial class WaylandServer : IAsyncDisposable
         }
     }
 
-    private WaylandClient EnqueueClient(WaylandServerSocket socket)
+    private WaylandClient EnqueueClient(IWaylandServerTransport socket)
     {
         var client = new WaylandClient(this, socket);
         var parser = new WaylandMessageParser(client);
@@ -320,18 +343,35 @@ public sealed partial class WaylandServer : IAsyncDisposable
     }
 
     /// <summary>
+    /// Record a readiness notification from an fd-less transport
+    /// (<see cref="WaylandTransportSignal"/>) and wake the dispatch loop.
+    /// Thread-safe; dropped silently after disposal.
+    /// </summary>
+    internal void SignalTransportReadiness(WaylandClient client, bool writable)
+    {
+        lock (_stateLock)
+        {
+            if (_disposed)
+                return;
+            _transportReadiness.Enqueue((client, writable));
+        }
+        _poll.Wake();
+    }
+
+    /// <summary>
     /// Idempotent cleanup of a single client: remove from epoll, collections,
     /// and dispose. Safe to call even if the client was already cleaned up.
     /// Must be called from the dispatch thread (inside <see cref="NextEventCore"/>).
     /// </summary>
     internal void CleanupClient(WaylandClient client)
     {
-        int fd = client.Socket.Fd;
-        if (_fdToClient.TryGetValue(fd, out var mapped) && mapped == client)
+        if (client.Transport.PollFd is int fd &&
+            _fdToClient.TryGetValue(fd, out var mapped) && mapped == client)
         {
             try { _poll.RemoveFd(fd); } catch { }
             _fdToClient.Remove(fd);
         }
+        _registeredClients.Remove(client);
         _clients.Remove(client);
         client.Parser?.Dispose();
         client.Dispose();
@@ -399,11 +439,13 @@ public sealed partial class WaylandServer : IAsyncDisposable
         // Clean up registered clients (dispatch-thread-only data)
         foreach (var client in _clients)
         {
-            try { _poll.RemoveFd(client.Socket.Fd); } catch { }
+            if (client.Transport.PollFd is int fd)
+                try { _poll.RemoveFd(fd); } catch { }
             client.Parser?.Dispose();
             client.Dispose();
         }
         _clients.Clear();
+        _registeredClients.Clear();
         _fdToClient.Clear();
         _poll.Dispose();
 

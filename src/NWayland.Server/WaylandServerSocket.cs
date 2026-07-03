@@ -14,7 +14,7 @@ namespace NWayland.Server;
 /// The socket is set to non-blocking mode. All I/O methods are non-blocking —
 /// readiness is determined externally via <see cref="WaylandEventPoll"/>.
 /// </remarks>
-public sealed class WaylandServerSocket : IDisposable, IWaylandSocketWriter
+public sealed class WaylandServerSocket : IWaylandServerTransport
 {
     /// <summary>
     /// Maximum file descriptors per sendmsg/recvmsg call.
@@ -62,6 +62,17 @@ public sealed class WaylandServerSocket : IDisposable, IWaylandSocketWriter
     /// </summary>
     internal int Fd => _fd;
 
+    /// <summary>The socket fd — registered with epoll for readiness.</summary>
+    public int? PollFd => _fd;
+
+    /// <summary>Kernel fds travel over this transport; release with close(2).</summary>
+    public void CloseFd(int fd) => close(fd);
+
+    /// <summary>Readiness comes from epoll; the signal is not used.</summary>
+    public void SetSignal(WaylandTransportSignal signal)
+    {
+    }
+
     /// <summary>
     /// True if the read side is broken (MSG_CTRUNC detected).
     /// Writes are still allowed to send error events before disconnecting.
@@ -72,7 +83,7 @@ public sealed class WaylandServerSocket : IDisposable, IWaylandSocketWriter
     /// Shut down the read side of the socket. Further reads will return 0.
     /// Call this on protocol errors to prevent reading corrupted data.
     /// </summary>
-    internal void ShutdownRead()
+    public void ShutdownRead()
     {
         if (!_readBroken)
         {
@@ -89,7 +100,7 @@ public sealed class WaylandServerSocket : IDisposable, IWaylandSocketWriter
     /// (BytesRead, FdsRead). BytesRead=-1 means EAGAIN. BytesRead=0 means disconnect.
     /// BytesRead is the total across both data buffers.
     /// </returns>
-    internal (int BytesRead, int FdsRead) TryReadNonBlocking(
+    public (int BytesRead, int FdsRead) TryReadNonBlocking(
         Memory<byte> buffer1, Memory<byte> buffer2,
         Memory<int> fdBuf1, Memory<int> fdBuf2)
     {
@@ -102,7 +113,7 @@ public sealed class WaylandServerSocket : IDisposable, IWaylandSocketWriter
     /// Non-blocking write attempt. Returns bytes sent, or -1 for EAGAIN.
     /// On partial write, FDs are still sent with the first chunk.
     /// </summary>
-    internal int TryWriteNonBlocking(ReadOnlyMemory<byte> buffer, ReadOnlyMemory<int> fds)
+    public int TryWriteNonBlocking(ReadOnlyMemory<byte> buffer, ReadOnlyMemory<int> fds)
     {
         ThrowIfDisposed();
         if (fds.Length > MaxFdsPerMessage)
@@ -110,9 +121,6 @@ public sealed class WaylandServerSocket : IDisposable, IWaylandSocketWriter
                 $"Cannot send more than {MaxFdsPerMessage} FDs per message, got {fds.Length}");
         return DoSendMsg(buffer, fds);
     }
-
-    int IWaylandSocketWriter.TryWriteNonBlocking(ReadOnlyMemory<byte> buffer, ReadOnlyMemory<int> fds)
-        => TryWriteNonBlocking(buffer, fds);
     private unsafe (int BytesRead, int FdsRead) DoRecvMsg(
         Memory<byte> buffer1, Memory<byte> buffer2,
         Memory<int> fdBuf1, Memory<int> fdBuf2)

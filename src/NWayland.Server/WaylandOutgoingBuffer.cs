@@ -10,7 +10,7 @@ namespace NWayland.Server;
 /// Abstraction for the write side of a socket, used by <see cref="WaylandOutgoingBuffer"/>
 /// for flushing. Enables testing without real sockets.
 /// </summary>
-internal interface IWaylandSocketWriter
+public interface IWaylandSocketWriter
 {
     /// <summary>
     /// Non-blocking write attempt. Returns bytes sent, or -1 for EAGAIN.
@@ -37,16 +37,21 @@ internal sealed class WaylandOutgoingBuffer
     private int _bytesUsed;
     private int[] _fds;
     private int _fdsUsed;
+    private readonly Action<int> _closeFd;
 
     // Event boundary tracking: each entry records (byteEnd, fdEnd) after an event.
     // Only events with FDs create a boundary; FD-less events are implicitly
     // coalesced with the next FD-bearing event or the final tail.
     private List<(int ByteEnd, int FdEnd)> _fdBoundaries = new();
 
-    public WaylandOutgoingBuffer(int initialByteCapacity = 4096, int initialFdCapacity = 32)
+    public WaylandOutgoingBuffer(int initialByteCapacity = 4096, int initialFdCapacity = 32,
+        Action<int>? closeFd = null)
     {
         _bytes = new byte[initialByteCapacity];
         _fds = new int[initialFdCapacity];
+        // fd-slot values belong to the client's transport — kernel fds by default,
+        // synthetic tokens for fd-less transports. The transport supplies the closer.
+        _closeFd = closeFd ?? (fd => NWayland.Server.Interop.LinuxInterop.close(fd));
     }
 
     public int BytesUsed => _bytesUsed;
@@ -133,7 +138,7 @@ internal sealed class WaylandOutgoingBuffer
         {
             // Close any FDs that were added during this failed serialization
             for (int i = savedFdsUsed; i < _fdsUsed; i++)
-                NWayland.Server.Interop.LinuxInterop.close(_fds[i]);
+                _closeFd(_fds[i]);
             _bytesUsed = savedBytesUsed;
             _fdsUsed = savedFdsUsed;
             throw;
@@ -239,7 +244,7 @@ internal sealed class WaylandOutgoingBuffer
     public void CloseUnsentFds()
     {
         for (int i = 0; i < _fdsUsed; i++)
-            NWayland.Server.Interop.LinuxInterop.close(_fds[i]);
+            _closeFd(_fds[i]);
         _fdsUsed = 0;
         _fdBoundaries.Clear();
     }
@@ -251,9 +256,13 @@ internal sealed class WaylandOutgoingBuffer
     /// </summary>
     /// <remarks>
     /// Rules enforced:
-    /// 1. All FDs for an event are sent in the same sendmsg as some bytes of that event.
-    /// 2. At most 28 FDs per sendmsg call.
-    /// 3. At least 1 byte of data per sendmsg (required by the kernel).
+    /// 1. All FDs for an event are sent in the same write as some bytes of that event.
+    /// 2. Each write carries at most one FD-bearing event's FDs — the FDs always
+    ///    belong to the <b>final</b> message of the write. Transports that must
+    ///    reassociate fds with messages (the waypipe channel's fd-count tagging)
+    ///    rely on this; it also keeps every write within the 28-fds-per-sendmsg
+    ///    kernel limit without further splitting.
+    /// 3. At least 1 byte of data per write (required by sendmsg).
     ///
     /// On partial writes (0 &lt; sent &lt; batchBytes): FDs are already delivered
     /// atomically by sendmsg, so we advance fdStart past them and only
@@ -263,60 +272,47 @@ internal sealed class WaylandOutgoingBuffer
     {
         int byteStart = 0;
         int fdStart = 0;
-        int batchFdCount = 0;
-        int batchByteEnd = 0;
 
         for (int i = 0; i < _fdBoundaries.Count; i++)
         {
             var (byteEnd, fdEnd) = _fdBoundaries[i];
-            int eventFds = fdEnd - (i == 0 ? 0 : _fdBoundaries[i - 1].FdEnd);
+            int eventFds = fdEnd - fdStart;
+            int batchBytes = byteEnd - byteStart;
 
-            if (batchFdCount > 0 && batchFdCount + eventFds > WaylandServerSocket.MaxFdsPerMessage)
-            {
-                int batchBytes = batchByteEnd - byteStart;
-                int sent = socket.TryWriteNonBlocking(
-                    _bytes.AsMemory(byteStart, batchBytes),
-                    _fds.AsMemory(fdStart, batchFdCount));
-                if (sent <= 0)
-                {
-                    CompactFrom(byteStart, fdStart);
-                    return false;
-                }
-                // sendmsg delivers FDs atomically — close sender's copies
-                CloseFdRange(fdStart, batchFdCount);
-                if (sent < batchBytes)
-                {
-                    // Partial write — FDs already delivered, compact unsent bytes
-                    CompactFrom(byteStart + sent, fdStart + batchFdCount);
-                    return false;
-                }
-                byteStart = batchByteEnd;
-                fdStart += batchFdCount;
-                batchFdCount = 0;
-            }
-
-            batchFdCount += eventFds;
-            batchByteEnd = byteEnd;
-        }
-
-        // Final batch (includes trailing FD-less events)
-        if (byteStart < _bytesUsed)
-        {
-            int finalBytes = _bytesUsed - byteStart;
             int sent = socket.TryWriteNonBlocking(
-                _bytes.AsMemory(byteStart, finalBytes),
-                _fds.AsMemory(fdStart, batchFdCount));
+                _bytes.AsMemory(byteStart, batchBytes),
+                _fds.AsMemory(fdStart, eventFds));
             if (sent <= 0)
             {
                 CompactFrom(byteStart, fdStart);
                 return false;
             }
             // sendmsg delivers FDs atomically — close sender's copies
-            CloseFdRange(fdStart, batchFdCount);
-            if (sent < finalBytes)
+            CloseFdRange(fdStart, eventFds);
+            if (sent < batchBytes)
             {
                 // Partial write — FDs already delivered, compact unsent bytes
-                CompactFrom(byteStart + sent, fdStart + batchFdCount);
+                CompactFrom(byteStart + sent, fdStart + eventFds);
+                return false;
+            }
+            byteStart = byteEnd;
+            fdStart = fdEnd;
+        }
+
+        // Final tail: trailing FD-less events after the last boundary.
+        if (byteStart < _bytesUsed)
+        {
+            int finalBytes = _bytesUsed - byteStart;
+            int sent = socket.TryWriteNonBlocking(
+                _bytes.AsMemory(byteStart, finalBytes), ReadOnlyMemory<int>.Empty);
+            if (sent <= 0)
+            {
+                CompactFrom(byteStart, fdStart);
+                return false;
+            }
+            if (sent < finalBytes)
+            {
+                CompactFrom(byteStart + sent, fdStart);
                 return false;
             }
         }
@@ -364,7 +360,7 @@ internal sealed class WaylandOutgoingBuffer
     private void CloseFdRange(int start, int count)
     {
         for (int j = start; j < start + count; j++)
-            NWayland.Server.Interop.LinuxInterop.close(_fds[j]);
+            _closeFd(_fds[j]);
     }
 
     private void EnsureByteCapacity(int additional)

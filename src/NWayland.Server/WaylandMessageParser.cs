@@ -141,7 +141,7 @@ internal sealed class WaylandMessageParser : IDisposable
             int toRead = Math.Min(FdBuffer.Count, fds.Length);
             int read = FdBuffer.Read(fds.Slice(0, toRead));
             for (int i = 0; i < read; i++)
-                Interop.LinuxInterop.close(fds[i]);
+                _client.Transport.CloseFd(fds[i]);
         }
     }
 

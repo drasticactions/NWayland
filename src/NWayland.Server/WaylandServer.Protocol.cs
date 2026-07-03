@@ -177,7 +177,7 @@ public sealed partial class WaylandServer
             client.PostError(protoError.Resource, protoError.Code, protoError.Message);
         else
         {
-            client.Socket.ShutdownRead();
+            client.Transport.ShutdownRead();
             parser.Dispose();
         }
     }

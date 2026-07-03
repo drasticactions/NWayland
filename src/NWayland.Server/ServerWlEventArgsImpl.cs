@@ -321,7 +321,7 @@ internal sealed class ServerWlEventArgsImpl : IWlEventArgsImpl
         if ((_consumedFds & bit) != 0)
             return;
         _consumedFds |= bit;
-        LinuxInterop.close(_args[num].Int);
+        _client.Transport.CloseFd(_args[num].Int);
     }
 
     public WlFixed GetWlFixed(int num)

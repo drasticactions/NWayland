@@ -77,21 +77,26 @@ public sealed partial class WaylandServer
 
             try
             {
-                _poll.AddFd(client.Socket.Fd, EPOLLIN);
+                if (client.Transport.PollFd is int fd)
+                    _poll.AddFd(fd, EPOLLIN);
+                else
+                    client.Transport.SetSignal(new WaylandTransportSignal(this, client));
             }
             catch
             {
-                // Dispose parser + socket directly (not client.Dispose()) to avoid
+                // Dispose parser + transport directly (not client.Dispose()) to avoid
                 // AcquireDispatchLock — the client was never registered and has no
                 // state worth protecting. Managed objects (wl_display resource, etc.)
                 // will be GC'd.
                 client.Parser?.Dispose();
-                client.Socket.Dispose();
+                client.Transport.Dispose();
                 continue;
             }
 
             _clients.Add(client);
-            _fdToClient[client.Socket.Fd] = client;
+            _registeredClients.Add(client);
+            if (client.Transport.PollFd is int pollFd)
+                _fdToClient[pollFd] = client;
         }
     }
 
@@ -113,7 +118,7 @@ public sealed partial class WaylandServer
             }
 
             // Already cleaned up by DisconnectClient (e.g. from HandleProtocolError path)?
-            if (!_fdToClient.TryGetValue(dead.Socket.Fd, out var mapped) || mapped != dead)
+            if (!_registeredClients.Contains(dead))
                 continue;
 
             CleanupClient(dead);
@@ -128,7 +133,7 @@ public sealed partial class WaylandServer
     private WaylandServerEvent? TryDrainAndParse(WaylandClient client)
     {
         var parser = client.Parser!;
-        var socket = client.Socket;
+        var socket = client.Transport;
 
         // If parser is already disposed (e.g. PostError was called), skip directly to disconnect
         if (parser.IsDisposed)
@@ -151,6 +156,14 @@ public sealed partial class WaylandServer
                 break;
             }
 
+            // Commit received fds before inspecting the byte count: a recvmsg
+            // can only deliver fds together with bytes, but a queued transport
+            // may legitimately report fd-slots alongside EAGAIN or EOF, and
+            // they must reach the ring so parsing (or parser disposal) can
+            // consume/release them.
+            if (result.fdsRead > 0)
+                parser.FdBuffer.Written(result.fdsRead);
+
             if (result.bytesRead < 0)
             {
                 parser.Readable = false;
@@ -171,7 +184,6 @@ public sealed partial class WaylandServer
             }
 
             parser.DataBuffer.Written(result.bytesRead);
-            parser.FdBuffer.Written(result.fdsRead);
         }
 
         return TryParseFromBuffer(client);
@@ -257,8 +269,10 @@ public sealed partial class WaylandServer
                 {
                     client.PendingWrite = true;
                     // Drop EPOLLIN to avoid spinning — we can't process requests
-                    // until the send buffer drains (back-pressure).
-                    _poll.ModFd(client.Socket.Fd, EPOLLOUT);
+                    // until the send buffer drains (back-pressure). fd-less
+                    // transports signal writability via WaylandTransportSignal.
+                    if (client.Transport.PollFd is int fd)
+                        _poll.ModFd(fd, EPOLLOUT);
                 }
             }
         }
@@ -315,13 +329,15 @@ public sealed partial class WaylandServer
                     {
                         c.PendingWrite = true;
                         // Drop EPOLLIN — back-pressure prevents processing requests
-                        _poll.ModFd(c.Socket.Fd, EPOLLOUT);
+                        if (c.Transport.PollFd is int fd)
+                            _poll.ModFd(fd, EPOLLOUT);
                     }
                 }
                 else if (c.PendingWrite)
                 {
                     c.PendingWrite = false;
-                    _poll.ModFd(c.Socket.Fd, EPOLLIN);
+                    if (c.Transport.PollFd is int fd)
+                        _poll.ModFd(fd, EPOLLIN);
                 }
             }
             catch { /* ignored — client may be mid-disconnect */ }
@@ -335,7 +351,18 @@ public sealed partial class WaylandServer
     /// </summary>
     private int PollAndDispatchReadiness(int timeoutMs)
     {
+        // Readiness notifications from fd-less transports (WaylandTransportSignal)
+        // are drained on the dispatch thread here. Anything already pending means
+        // we must not block in the poll below.
+        int signalled = DrainTransportReadiness();
+        if (signalled > 0)
+            timeoutMs = 0;
+
         int n = _poll.Wait(_epollResults, timeoutMs);
+
+        // Notifications may have arrived while we were blocked (the signal wakes
+        // the poll but produces no fd result) — drain again.
+        signalled += DrainTransportReadiness();
 
         for (int i = 0; i < n; i++)
         {
@@ -354,7 +381,9 @@ public sealed partial class WaylandServer
                     if (client.TryFlush())
                     {
                         client.PendingWrite = false;
-                        _poll.ModFd(client.Socket.Fd, EPOLLIN);
+                        // This branch is only reached via an epoll result, so the
+                        // client necessarily has a PollFd.
+                        _poll.ModFd(client.Transport.PollFd!.Value, EPOLLIN);
                     }
                 }
                 catch { /* ignored */ }
@@ -372,6 +401,51 @@ public sealed partial class WaylandServer
             }
         }
 
-        return n;
+        return n + signalled;
+    }
+
+    /// <summary>
+    /// Drain queued <see cref="WaylandTransportSignal"/> notifications into
+    /// dispatch-thread readiness state. Returns the number of notifications that
+    /// affected a registered client.
+    /// </summary>
+    private int DrainTransportReadiness()
+    {
+        int affected = 0;
+        while (true)
+        {
+            WaylandClient client;
+            bool writable;
+            lock (_stateLock)
+            {
+                if (_transportReadiness.Count == 0)
+                    return affected;
+                (client, writable) = _transportReadiness.Dequeue();
+            }
+
+            // The client may have been cleaned up (or not yet registered — in that
+            // case its parser starts Readable=true, so nothing is lost).
+            if (!_registeredClients.Contains(client))
+                continue;
+
+            if (writable)
+            {
+                if (client.PendingWrite)
+                {
+                    try
+                    {
+                        if (client.TryFlush())
+                            client.PendingWrite = false;
+                    }
+                    catch { /* ignored — client may be mid-disconnect */ }
+                    affected++;
+                }
+            }
+            else
+            {
+                client.Parser!.Readable = true;
+                affected++;
+            }
+        }
     }
 }

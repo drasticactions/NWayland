@@ -11,11 +11,11 @@ namespace NWayland.Server;
 public sealed class WaylandClient : IDisposable
 {
     private readonly WaylandServer _server;
-    private readonly WaylandServerSocket _socket;
+    private readonly IWaylandServerTransport _transport;
     private readonly WlObjectMap _objectMap = new();
     private readonly List<WaylandServerGlobal> _globals = new();
     private readonly List<uint> _registryIds = new();
-    private readonly WaylandOutgoingBuffer _outgoingBuffer = new();
+    private readonly WaylandOutgoingBuffer _outgoingBuffer;
     private readonly WlDisplay.Server _displayResource;
     private uint _nextGlobalId;
     private volatile bool _disposed;
@@ -33,10 +33,11 @@ public sealed class WaylandClient : IDisposable
     /// </summary>
     internal bool PendingWrite { get; set; }
 
-    internal WaylandClient(WaylandServer server, WaylandServerSocket socket)
+    internal WaylandClient(WaylandServer server, IWaylandServerTransport transport)
     {
         _server = server;
-        _socket = socket;
+        _transport = transport;
+        _outgoingBuffer = new WaylandOutgoingBuffer(closeFd: transport.CloseFd);
 
         // wl_display is always object ID 1
         _displayResource = new WlDisplay.Server(new WlResourceCreationContext
@@ -80,7 +81,7 @@ public sealed class WaylandClient : IDisposable
     public bool TryFlush()
     {
         using (_server.AcquireDispatchLock())
-            return _outgoingBuffer.TryFlushToSocket(_socket);
+            return _outgoingBuffer.TryFlushToSocket(_transport);
     }
 
     /// <summary>
@@ -106,8 +107,8 @@ public sealed class WaylandClient : IDisposable
             // object_id arg is non-nullable, so we must pass a real object, and the display is the
             // canonical target for global errors (matches libwayland's wl_resource_post_no_memory).
             _displayResource.Error(resource ?? _displayResource, code, message);
-            try { _outgoingBuffer.TryFlushToSocket(_socket); } catch { /* best-effort */ }
-            _socket.ShutdownRead();
+            try { _outgoingBuffer.TryFlushToSocket(_transport); } catch { /* best-effort */ }
+            _transport.ShutdownRead();
             if (Parser != null)
                 Parser.Dispose();
             _server.EnqueueDisconnect(this);
@@ -162,7 +163,7 @@ public sealed class WaylandClient : IDisposable
 
     internal WlObjectMap ObjectMap => _objectMap;
     internal WaylandOutgoingBuffer OutgoingBuffer => _outgoingBuffer;
-    internal WaylandServerSocket Socket => _socket;
+    internal IWaylandServerTransport Transport => _transport;
     internal WaylandServer Server => _server;
     internal IReadOnlyList<WaylandServerGlobal> Globals => _globals;
 
@@ -239,6 +240,6 @@ public sealed class WaylandClient : IDisposable
         foreach (var resource in toDispose)
             resource.Dispose();
 
-        _socket.Dispose();
+        _transport.Dispose();
     }
 }

@@ -227,8 +227,11 @@ public class OutgoingBufferTests : IDisposable
     }
 
     [Fact]
-    public void MultipleFdEvents_BatchedTogether()
+    public void MultipleFdEvents_OneWritePerFdEvent()
     {
+        // Each FD-bearing event flushes as its own write so a transport can
+        // reassociate the fds with the write's final message (the waypipe
+        // channel's fd-count tagging depends on this).
         var (r1, w1) = CreatePipe();
         var (r2, w2) = CreatePipe();
         try
@@ -238,9 +241,11 @@ public class OutgoingBufferTests : IDisposable
 
             var mock = new RecordingFlushTarget();
             Assert.True(_buf.TryFlushToSocket(mock));
-            Assert.Single(mock.Sends);
-            Assert.Equal(16, mock.Sends[0].Bytes);
-            Assert.Equal(2, mock.Sends[0].Fds);
+            Assert.Equal(2, mock.Sends.Count);
+            Assert.Equal(8, mock.Sends[0].Bytes);
+            Assert.Equal(1, mock.Sends[0].Fds);
+            Assert.Equal(8, mock.Sends[1].Bytes);
+            Assert.Equal(1, mock.Sends[1].Fds);
         }
         finally
         {
@@ -351,11 +356,16 @@ public class OutgoingBufferTests : IDisposable
             WriteFdEvent(2, r);      // 8 bytes, 1 FD
             WriteUIntEvent(3, 200);  // 12 bytes
 
+            // Preceding FD-less events coalesce with the FD event (whose fds ride
+            // with its own bytes as the write's final message); trailing FD-less
+            // events flush as the fd-free tail.
             var mock = new RecordingFlushTarget();
             Assert.True(_buf.TryFlushToSocket(mock));
-            Assert.Single(mock.Sends);
-            Assert.Equal(32, mock.Sends[0].Bytes);
+            Assert.Equal(2, mock.Sends.Count);
+            Assert.Equal(20, mock.Sends[0].Bytes);
             Assert.Equal(1, mock.Sends[0].Fds);
+            Assert.Equal(12, mock.Sends[1].Bytes);
+            Assert.Equal(0, mock.Sends[1].Fds);
         }
         finally
         {
